@@ -121,7 +121,7 @@ On first open, each user sees a one-time consent prompt that authorizes the app 
   has already been loaded separately (about 100M rows). The app validates and uses an
   existing table if one is present.
 * Results are displayed in the app only and are not persisted to a table.
-* If the dependency install fails on `databricks-sql-connector[kernel]>=4.5.0`, change that
+* If the dependency install fails on `databricks-sql-connector[kernel]>=4.9,<5`, change that
   line to `databricks-sql-connector>=4.0.0` and redeploy. The app automatically falls back
   to a slower connector mode for query execution.
 
