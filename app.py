@@ -1356,7 +1356,7 @@ elif st.session_state.step == "2b":
         for wl_key in tpch_workloads:
             v = validations.get(wl_key, {})
             if v.get("needs_creation"):
-                any_needs_creation = True
+                _flags["needs_creation"] = True
                 needs_create_keys.append(wl_key)
             else:
                 valid_keys.append(wl_key)
@@ -1378,9 +1378,9 @@ elif st.session_state.step == "2b":
                     info = v.get("tables", {}).get(t)
                     if info is None:
                         row += " \u274c missing |"
-                        any_has_issues = True
+                        _flags["has_issues"] = True
                     elif info.get("issues"):
-                        any_has_issues = True
+                        _flags["has_issues"] = True
                         row += f" \u26a0\ufe0f |"
                         for iss in info["issues"]:
                             if "stats missing" in iss and "auto-fix failed" in iss:
