@@ -2,6 +2,17 @@
 
 ---
 
+## Turning the App On or Off
+
+- **The app does not stop automatically.** It keeps running (and its compute is billed) until someone stops it, even when nobody is using it. We suggest stopping it when it isn't in use.
+- **Start and stop are done from the app's overview page in Databricks**, not from inside the app. Use **Open app overview page** in this sidebar, or go to **Compute → Apps → lakehouse-rt-benchmark** in your workspace, then click **Stop** or **Start** at the top of the page.
+- You need **CAN MANAGE** on the app to start or stop it. Ask the app owner if the buttons are unavailable.
+- Stopping the app ends any benchmark that is in progress. Wait for runs to finish first.
+- While the app is stopped, its URL won't load. Start it from the overview page; it is usually ready within a minute or two.
+- Stopping the app does not stop your SQL warehouses. They stop on their own after their auto-stop idle timeout.
+
+---
+
 ## Warehouse Issues
 
 ### Could not connect to warehouse

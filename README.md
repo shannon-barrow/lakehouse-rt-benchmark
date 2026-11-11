@@ -114,6 +114,23 @@ On first open, each user sees a one-time consent prompt that authorizes the app 
 5. **Run**: sequential or parallel, 3 repetitions (1 cold + 2 warm), result cache disabled.
 6. **Results**: geomean, per-query latency, cold vs warm, and parallel wall-clock time.
 
+### Turning the app on and off
+
+The app **does not stop automatically** when idle. Its compute keeps running, and is billed,
+until someone stops it, so we suggest stopping it whenever it isn't being used.
+
+Start and stop the app from its overview page in Databricks (**Compute > Apps >
+`lakehouse-rt-benchmark`**, then **Stop** or **Start**). The app's sidebar has an
+**Open app overview page** link to it. Notes:
+
+* Starting or stopping requires **CAN MANAGE** on the app.
+* Stopping the app ends any benchmark in progress.
+* While the app is stopped its URL won't load; start it from the overview page first.
+* Stopping the app does not stop the SQL warehouses; they follow their own auto-stop setting.
+
+With the CLI: `databricks apps stop lakehouse-rt-benchmark` and
+`databricks apps start lakehouse-rt-benchmark`.
+
 ## 6. Notes and limitations
 
 * **ClickBench** expects source data at `samples.clickbench.hits`, which is not in the
