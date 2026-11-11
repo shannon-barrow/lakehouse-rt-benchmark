@@ -1273,22 +1273,6 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.markdown("---")
-
-    # --- Turning the app on/off: done from the app's overview page (no auto-stop) ---
-    _app_name = os.getenv("DATABRICKS_APP_NAME", "lakehouse-rt-benchmark")
-    _ws_id = os.getenv("DATABRICKS_WORKSPACE_ID", "")
-    _app_page = (f"{HOST}/apps/{_app_name}" + (f"?o={_ws_id}" if _ws_id else "")) if _raw_host else ""
-    st.markdown("**Turning this app on or off**")
-    st.caption(
-        "This app does **not** stop automatically when idle, and its compute is billed while it "
-        "is running. We suggest stopping it when it isn't being used.\n\n"
-        "To turn the app on or off, use **Start** / **Stop** on the app's overview page in "
-        "Databricks (requires CAN MANAGE on the app). Stopping the app ends any benchmark "
-        "that is in progress.")
-    if _app_page:
-        st.link_button("Open app overview page", _app_page, use_container_width=True)
-    st.markdown("---")
-
     # Load help content from help.md (ships with the app)
     _help_path = os.path.join(os.path.dirname(__file__), "help.md")
     try:
@@ -1308,6 +1292,17 @@ with st.sidebar:
             "ask your question (e.g. *\"Why is my benchmark warehouse not showing up "
             "in the lakehouse-rt-benchmark app?\"*)"
         )
+
+    # --- Turning the app on/off: done from the app's overview page (no scale to 0) ---
+    _app_name = os.getenv("DATABRICKS_APP_NAME", "lakehouse-rt-benchmark")
+    _ws_id = os.getenv("DATABRICKS_WORKSPACE_ID", "")
+    _app_page = (f"{HOST}/apps/{_app_name}" + (f"?o={_ws_id}" if _ws_id else "")) if _raw_host else ""
+    st.markdown("---")
+    st.caption(
+        "The app does not scale to 0 when idle. The link below takes you to the App's "
+        "configuration, where you can turn on/off as needed (requires CAN MANAGE on the app).")
+    if _app_page:
+        st.link_button("Open app overview page", _app_page, use_container_width=True)
 
 
 # ===================================================================
