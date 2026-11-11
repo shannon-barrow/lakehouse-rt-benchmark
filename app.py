@@ -629,6 +629,205 @@ def create_reyden_warehouse(name: str, size: str = "Small") -> dict:
 
 
 
+# ---------------------------------------------------------------------------
+# Catalog discovery & permission checks
+# SQL-based (information_schema) because the app's user token only carries the
+# `sql` scope -- the Unity Catalog REST APIs are not available to it.
+# ---------------------------------------------------------------------------
+_HIDDEN_CATALOGS = {"system", "samples", "hive_metastore"}
+_CATALOG_USE_PRIVS = {"USE_CATALOG", "ALL_PRIVILEGES"}
+_SCHEMA_CREATE_PRIVS = {"CREATE_SCHEMA", "ALL_PRIVILEGES"}
+_SCHEMA_USE_PRIVS = {"USE_SCHEMA", "ALL_PRIVILEGES"}
+_TABLE_CREATE_PRIVS = {"CREATE_TABLE", "ALL_PRIVILEGES"}
+_ME_GRANTEE = ("(p.grantee = current_user() OR is_account_group_member(p.grantee) "
+               "OR is_member(p.grantee))")
+_PERM_ERR_MARKERS = ("permission_denied", "insufficient_permissions", "does not have",
+                     "not authorized", "access denied", "unauthorized")
+
+
+def _sql_str(v) -> str:
+    """Quote a value as a SQL string literal."""
+    return "'" + str(v).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _q(ident) -> str:
+    """Quote a SQL identifier with backticks."""
+    return "`" + str(ident).replace("`", "``") + "`"
+
+
+def _split_privs(raw) -> set:
+    return {p.strip().upper().replace(" ", "_") for p in str(raw or "").split(",") if p.strip()}
+
+
+def _is_true(v) -> bool:
+    return str(v).strip().lower() == "true"
+
+
+def _is_permission_error(msg) -> bool:
+    m = str(msg or "").lower()
+    return any(k in m for k in _PERM_ERR_MARKERS)
+
+
+def _pick_metadata_warehouse(warehouses: list, preferred_id: str | None = None) -> str | None:
+    """Pick a warehouse for read-only metadata queries, preferring a running one."""
+    usable = [wh for wh in warehouses if wh.get("id")]
+    pref = preferred_id if preferred_id and preferred_id != "__CREATE_NEW__" else None
+    for wh in usable:
+        if wh["id"] == pref and "RUNNING" in str(wh.get("state", "")).upper():
+            return pref
+    for wh in usable:
+        if "RUNNING" in str(wh.get("state", "")).upper():
+            return wh["id"]
+    if pref:
+        return pref
+    return usable[0]["id"] if usable else None
+
+
+def list_catalogs(warehouse_id: str) -> tuple[list, str, str]:
+    """List catalogs visible to the current user with their effective privileges.
+    Returns (catalogs, current_user, error). Group grants are resolved via
+    is_account_group_member()."""
+    query = (
+        "SELECT c.catalog_name, c.catalog_owner, "
+        "CAST((c.catalog_owner = current_user() OR is_account_group_member(c.catalog_owner) "
+        "OR is_member(c.catalog_owner)) AS STRING) AS is_owner, "
+        "array_join(collect_set(p.privilege_type), ',') AS privs, current_user() AS me "
+        "FROM system.information_schema.catalogs c "
+        "LEFT JOIN system.information_schema.catalog_privileges p "
+        f"ON p.catalog_name = c.catalog_name AND {_ME_GRANTEE} "
+        "GROUP BY c.catalog_name, c.catalog_owner ORDER BY c.catalog_name"
+    )
+    rows, err = execute_sql_rows(warehouse_id, query, "system", "information_schema")
+    if err:
+        return [], "", err
+    me, out = "", []
+    for r in rows:
+        me = me or str(r.get("me") or "")
+        name = str(r.get("catalog_name") or "")
+        if not name or name in _HIDDEN_CATALOGS or name.startswith("__"):
+            continue
+        privs = _split_privs(r.get("privs"))
+        is_owner = _is_true(r.get("is_owner"))
+        use_cat = is_owner or bool(privs & _CATALOG_USE_PRIVS)
+        if not use_cat:
+            continue  # visible (e.g. BROWSE only) but not usable
+        out.append({
+            "name": name,
+            "owner": str(r.get("catalog_owner") or ""),
+            "is_owner": is_owner,
+            "privs": privs,
+            "can_create_schema": is_owner or (use_cat and bool(privs & _SCHEMA_CREATE_PRIVS)),
+            "can_manage": is_owner or "MANAGE" in privs,
+        })
+    return out, me, ""
+
+
+def check_create_permissions(warehouse_id: str, catalog: str, schemas: list) -> dict:
+    """Pre-flight: can the current user create the given benchmark schemas (or
+    tables inside them, if the schema already exists) in `catalog`?
+
+    Based on Unity Catalog grants visible to the user (ownership, direct + group
+    grants, inherited). Metastore-admin access is not detectable here, so callers
+    should allow an override. Returns a dict; `blocked` lists schemas the user
+    likely cannot populate."""
+    cat = str(catalog or "").strip().lower()
+    schemas = [str(s).lower() for s in schemas]
+    perm = {"catalog": catalog, "me": "", "catalog_owner": "", "catalog_missing": False,
+            "can_create_schema": False, "can_manage_catalog": False,
+            "schemas": {}, "blocked": [], "error": ""}
+    q_cat = (
+        "SELECT c.catalog_owner, "
+        "CAST((c.catalog_owner = current_user() OR is_account_group_member(c.catalog_owner) "
+        "OR is_member(c.catalog_owner)) AS STRING) AS is_owner, "
+        "array_join(collect_set(p.privilege_type), ',') AS privs, current_user() AS me "
+        "FROM system.information_schema.catalogs c "
+        "LEFT JOIN system.information_schema.catalog_privileges p "
+        f"ON p.catalog_name = c.catalog_name AND {_ME_GRANTEE} "
+        f"WHERE c.catalog_name = {_sql_str(cat)} GROUP BY c.catalog_owner"
+    )
+    rows, err = execute_sql_rows(warehouse_id, q_cat, "system", "information_schema")
+    if err:
+        perm["error"] = err
+        return perm
+    if not rows:
+        perm["catalog_missing"] = True
+        perm["blocked"] = list(schemas)
+        return perm
+
+    r = rows[0]
+    cat_owner = _is_true(r.get("is_owner"))
+    cprivs = _split_privs(r.get("privs"))
+    use_cat = cat_owner or bool(cprivs & _CATALOG_USE_PRIVS)
+    perm["me"] = str(r.get("me") or "")
+    perm["catalog_owner"] = str(r.get("catalog_owner") or "")
+    perm["can_create_schema"] = cat_owner or (use_cat and bool(cprivs & _SCHEMA_CREATE_PRIVS))
+    perm["can_manage_catalog"] = cat_owner or "MANAGE" in cprivs
+    if not schemas:
+        return perm
+
+    in_list = ", ".join(_sql_str(s) for s in schemas)
+    q_sch = (
+        "SELECT s.schema_name, s.schema_owner, "
+        "CAST((s.schema_owner = current_user() OR is_account_group_member(s.schema_owner) "
+        "OR is_member(s.schema_owner)) AS STRING) AS is_owner, "
+        "array_join(collect_set(p.privilege_type), ',') AS privs "
+        "FROM system.information_schema.schemata s "
+        "LEFT JOIN system.information_schema.schema_privileges p "
+        f"ON p.catalog_name = s.catalog_name AND p.schema_name = s.schema_name AND {_ME_GRANTEE} "
+        f"WHERE s.catalog_name = {_sql_str(cat)} AND s.schema_name IN ({in_list}) "
+        "GROUP BY s.schema_name, s.schema_owner"
+    )
+    srows, serr = execute_sql_rows(warehouse_id, q_sch, "system", "information_schema")
+    if serr:
+        perm["error"] = serr
+        return perm
+    found = {str(x.get("schema_name") or "").lower(): x for x in srows}
+    for s in schemas:
+        x = found.get(s)
+        if x is None:
+            ok = perm["can_create_schema"]
+            perm["schemas"][s] = {"exists": False, "owner": "", "ok": ok}
+        else:
+            s_owner = _is_true(x.get("is_owner"))
+            sprivs = _split_privs(x.get("privs"))
+            ok = cat_owner or (use_cat and (s_owner or (
+                bool(sprivs & _SCHEMA_USE_PRIVS) and bool(sprivs & _TABLE_CREATE_PRIVS))))
+            perm["schemas"][s] = {"exists": True, "owner": str(x.get("schema_owner") or ""), "ok": ok}
+        if not ok:
+            perm["blocked"].append(s)
+    return perm
+
+
+def _render_permission_help(perm: dict, catalogs: list | None = None) -> None:
+    """Explain a data-creation permission problem and list concrete ways to resolve it."""
+    catalog = perm.get("catalog", "")
+    me = (perm.get("me") or (st.session_state.get("_catalogs") or {}).get("me")
+          or "<your-user-or-group>")
+    blocked = list(perm.get("blocked") or [])
+    sch_info = perm.get("schemas") or {}
+    new_schemas = [s for s in blocked if not sch_info.get(s, {}).get("exists")]
+    existing = [s for s in blocked if sch_info.get(s, {}).get("exists")]
+    owner = perm.get("catalog_owner") or ""
+    missing_cat = perm.get("catalog_missing")
+
+    if missing_cat:
+        st.error(
+            f"Catalog `{catalog}` doesn't exist or you don't have access to it. "
+            f"Please request access to catalog `{catalog}`, or choose a different catalog.")
+        return
+    if new_schemas:
+        st.error(
+            f"Benchmark data doesn't exist in catalog `{catalog}`, and you don't have "
+            f"permission to create schemas there. Please request access to create schemas "
+            f"in catalog `{catalog}`, or choose a different catalog.")
+    if existing:
+        st.error(
+            f"Benchmark data is incomplete in catalog `{catalog}`, and you don't have "
+            f"permission to create tables in " + ", ".join(f"`{catalog}.{s}`" for s in existing)
+            + ". Please request access to create tables in those schemas, or choose a "
+            "different catalog.")
+
+
 EXPECTED_ROWS = {
     "tpch_sf1": {"region": 5, "nation": 25, "supplier": 10_000, "customer": 150_000,
                  "part": 200_000, "partsupp": 800_000, "orders": 1_500_000, "lineitem": 6_001_215},
@@ -692,11 +891,12 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
     query = (
         f"SELECT table_name, CAST(NULL AS BIGINT) AS row_count "
         f"FROM system.information_schema.tables "
-        f"WHERE table_catalog = '{catalog}' "
+        f"WHERE table_catalog = {_sql_str(catalog)} "
         f"AND table_schema = '{schema}' "
         f"AND LOWER(table_name) IN ({table_in})"
     )
-    rows, err = execute_sql_rows(warehouse_id, query, catalog, "default")
+    # Run from system context: the target catalog may be unusable or lack a `default` schema
+    rows, err = execute_sql_rows(warehouse_id, query, "system", "information_schema")
     if err:
         result["issues"].append(f"Schema check failed: {err}")
         return result
@@ -732,7 +932,7 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
         # Row count
         cnt_rows, cnt_err = execute_sql_rows(
             warehouse_id,
-            f"SELECT COUNT(1) AS cnt FROM {catalog}.{schema}.{table}",
+            f"SELECT COUNT(1) AS cnt FROM {_q(catalog)}.{schema}.{table}",
             catalog, schema, headers=_hdrs)
         if not cnt_err and cnt_rows:
             try:
@@ -754,7 +954,7 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
         # Check stats + clustering via DESCRIBE DETAIL
         det_rows, det_err = execute_sql_rows(
             warehouse_id,
-            f"DESCRIBE DETAIL {catalog}.{schema}.{table}",
+            f"DESCRIBE DETAIL {_q(catalog)}.{schema}.{table}",
             catalog, schema, headers=_hdrs)
         needs_stats = False
         if not det_err and det_rows:
@@ -762,7 +962,7 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
             # Check stats via DESCRIBE EXTENDED
             ext_rows, ext_err = execute_sql_rows(
                 warehouse_id,
-                f"DESCRIBE EXTENDED {catalog}.{schema}.{table}",
+                f"DESCRIBE EXTENDED {_q(catalog)}.{schema}.{table}",
                 catalog, schema, headers=_hdrs)
             stats_found = False
             if not ext_err and ext_rows:
@@ -812,20 +1012,20 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
                 _w_hdrs = _hdrs  # same user token
                 fix_result = execute_sql(
                     write_warehouse_id,
-                    f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
+                    f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
                     catalog, schema, headers=_w_hdrs)
                 if fix_result.get("status") != "ok":
                     info["issues"].append(
                         f"stats missing; auto-fix failed — run: "
-                        f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
+                        f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
             except Exception:
                 info["issues"].append(
                     f"stats missing; auto-fix failed — run: "
-                    f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
+                    f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
         elif needs_stats:
             info["issues"].append(
                 f"stats missing — run: "
-                f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
+                f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS")
 
         return table, info
 
@@ -856,8 +1056,9 @@ def validate_benchmark_data(warehouse_id: str, catalog: str, workload_key: str,
 
 
 def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
-                            progress_fn=None) -> None:
-    """Create the benchmark schema + tables. Parallelizes CTAS, OPTIMIZE, and ANALYZE phases."""
+                            progress_fn=None) -> list:
+    """Create the benchmark schema + tables. Parallelizes CTAS, OPTIMIZE, and ANALYZE phases.
+    Returns a list of error strings (empty on success). Never raises."""
     import sys
     meta = WORKLOAD_META[workload_key]
     schema = _target_schema(workload_key)
@@ -876,8 +1077,14 @@ def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
 
     if progress_fn:
         progress_fn("Creating schema...", 0, total_ops)
-    execute_sql(warehouse_id, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}", catalog, "default",
-                headers=_hdrs)
+    r_schema = execute_sql(warehouse_id, f"CREATE SCHEMA IF NOT EXISTS {_q(catalog)}.{schema}",
+                           "system", "information_schema", headers=_hdrs)
+    if r_schema["status"] != "ok":
+        err = f"CREATE SCHEMA {catalog}.{schema}: {r_schema.get('error') or 'unknown error'}"
+        print(f"[create] FAILED: {err}", flush=True)
+        if progress_fn:
+            progress_fn(f"\u274c {err}", 0, total_ops)
+        return [err]
 
     def _run_table_pipeline(t):
         """Run CTAS \u2192 OPTIMIZE \u2192 ANALYZE for a single table in this thread."""
@@ -888,7 +1095,7 @@ def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
         if t in cluster_spec:
             cols = ", ".join(cluster_spec[t])
             cluster_clause = f" CLUSTER BY ({cols})"
-        ctas_sql = (f"CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{t} "
+        ctas_sql = (f"CREATE TABLE IF NOT EXISTS {_q(catalog)}.{schema}.{t} "
                     f"USING DELTA{cluster_clause} AS SELECT * FROM samples.{source_schema}.{t}")
         print(f"[create] CTAS {t}: submitting...", flush=True)
         r = execute_sql(warehouse_id, ctas_sql, catalog, schema, headers=_hdrs)
@@ -903,7 +1110,7 @@ def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
         # 2. OPTIMIZE (only for applicable tables, skip if CTAS failed)
         if t in optimize_tables and not t_errors:
             print(f"[create] OPTIMIZE {t}: submitting...", flush=True)
-            r = execute_sql(warehouse_id, f"OPTIMIZE {catalog}.{schema}.{t} FULL",
+            r = execute_sql(warehouse_id, f"OPTIMIZE {_q(catalog)}.{schema}.{t} FULL",
                             catalog, schema, headers=_hdrs)
             if r["status"] != "ok":
                 err = f"OPTIMIZE {t}: {r.get('error', 'unknown')}"
@@ -918,7 +1125,7 @@ def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
         if not t_errors:
             print(f"[create] ANALYZE {t}: submitting...", flush=True)
             r = execute_sql(warehouse_id,
-                            f"ANALYZE TABLE {catalog}.{schema}.{t} COMPUTE STATISTICS FOR ALL COLUMNS",
+                            f"ANALYZE TABLE {_q(catalog)}.{schema}.{t} COMPUTE STATISTICS FOR ALL COLUMNS",
                             catalog, schema, headers=_hdrs)
             if r["status"] != "ok":
                 err = f"ANALYZE {t}: {r.get('error', 'unknown')}"
@@ -956,7 +1163,7 @@ def create_benchmark_tables(warehouse_id: str, catalog: str, workload_key: str,
 
     if _errors:
         print(f"[create_benchmark_tables] WARNINGS: {_errors}", file=sys.stderr, flush=True)
-    # Never raise \u2014 let the caller proceed to benchmark even with partial errors
+    return _errors
 
 
 def fix_table_issue(warehouse_id: str, catalog: str, workload_key: str,
@@ -970,31 +1177,31 @@ def fix_table_issue(warehouse_id: str, catalog: str, workload_key: str,
     if issue_type == "row_count":
         if progress_fn:
             progress_fn(f"Reloading {table}...")
-        execute_sql(warehouse_id, f"DROP TABLE IF EXISTS {catalog}.{schema}.{table}", catalog, schema)
+        execute_sql(warehouse_id, f"DROP TABLE IF EXISTS {_q(catalog)}.{schema}.{table}", catalog, schema)
         cluster_clause = ""
         if table in cluster_spec:
             cols = ", ".join(cluster_spec[table])
             cluster_clause = f" CLUSTER BY ({cols})"
         execute_sql(
             warehouse_id,
-            f"CREATE TABLE {catalog}.{schema}.{table} "
+            f"CREATE TABLE {_q(catalog)}.{schema}.{table} "
             f"USING DELTA{cluster_clause} AS SELECT * FROM samples.{source_schema}.{table}",
             catalog, schema)
         if table in optimize_tables:
             if progress_fn:
                 progress_fn(f"Optimizing {table}...")
-            execute_sql(warehouse_id, f"OPTIMIZE {catalog}.{schema}.{table} FULL", catalog, schema)
+            execute_sql(warehouse_id, f"OPTIMIZE {_q(catalog)}.{schema}.{table} FULL", catalog, schema)
         if progress_fn:
             progress_fn(f"Analyzing {table}...")
         execute_sql(warehouse_id,
-                    f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
+                    f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
                     catalog, schema)
 
     elif issue_type == "stats":
         if progress_fn:
             progress_fn(f"Computing statistics for {table}...")
         execute_sql(warehouse_id,
-                    f"ANALYZE TABLE {catalog}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
+                    f"ANALYZE TABLE {_q(catalog)}.{schema}.{table} COMPUTE STATISTICS FOR ALL COLUMNS",
                     catalog, schema)
 
     elif issue_type == "clustering":
@@ -1003,11 +1210,11 @@ def fix_table_issue(warehouse_id: str, catalog: str, workload_key: str,
         if table in cluster_spec:
             cols = ", ".join(cluster_spec[table])
             execute_sql(warehouse_id,
-                        f"ALTER TABLE {catalog}.{schema}.{table} CLUSTER BY ({cols})",
+                        f"ALTER TABLE {_q(catalog)}.{schema}.{table} CLUSTER BY ({cols})",
                         catalog, schema)
             if progress_fn:
                 progress_fn(f"Optimizing {table}...")
-            execute_sql(warehouse_id, f"OPTIMIZE {catalog}.{schema}.{table} FULL", catalog, schema)
+            execute_sql(warehouse_id, f"OPTIMIZE {_q(catalog)}.{schema}.{table} FULL", catalog, schema)
 
 
 
@@ -1187,8 +1394,9 @@ elif st.session_state.step == 2:
         wh_mode = st.radio("Warehouse", ["Use existing", "Create new"],
                            horizontal=True, label_visibility="collapsed")
     with col_refresh:
-        if st.button("\u21bb Refresh", help="Reload warehouse list"):
+        if st.button("\u21bb Refresh", help="Reload warehouse and catalog lists"):
             st.session_state.pop("_all_warehouses", None)
+            st.session_state.pop("_catalogs", None)
             st.rerun()
 
     warehouse_id = warehouse_name = None
@@ -1211,9 +1419,45 @@ elif st.session_state.step == 2:
             warehouse_name = new_wh_name
             st.session_state._new_wh_size = required_size
 
-    catalog = st.text_input("Catalog", value="main")
-    if not catalog:
-        catalog = "main"
+    # --- Catalog (dropdown of catalogs the signed-in user can access) ---
+    st.markdown("**Catalog** (where the benchmark schemas live or will be created)")
+    if "_catalogs" not in st.session_state:
+        _meta_wh = _pick_metadata_warehouse(all_warehouses, warehouse_id)
+        if _meta_wh:
+            with st.spinner("Loading catalogs..."):
+                _cats, _me, _cat_err = list_catalogs(_meta_wh)
+        else:
+            _cats, _me, _cat_err = [], "", "no SQL warehouse available to list catalogs"
+        st.session_state._catalogs = {"items": _cats, "me": _me, "error": _cat_err}
+    _cat_state = st.session_state._catalogs
+    _cats = _cat_state["items"]
+    _OTHER_CATALOG = "__OTHER__"
+
+    if _cats:
+        _names = [c["name"] for c in _cats]
+        _by_name = {c["name"]: c for c in _cats}
+        _cur = st.session_state.get("catalog") or "main"
+        if _cur in _by_name:
+            _default_idx = _names.index(_cur)
+        else:
+            _creatable = [i for i, c in enumerate(_cats) if c["can_create_schema"]]
+            _default_idx = _creatable[0] if _creatable else 0
+
+        def _catalog_label(n):
+            return "Other (enter a catalog name)..." if n == _OTHER_CATALOG else n
+
+        _sel_cat = st.selectbox("Catalog", _names + [_OTHER_CATALOG], index=_default_idx,
+                                format_func=_catalog_label, label_visibility="collapsed")
+        if _sel_cat == _OTHER_CATALOG:
+            catalog = st.text_input("Catalog name", value="",
+                                    placeholder="e.g. my_catalog").strip()
+        else:
+            catalog = _sel_cat
+    else:
+        if _cat_state.get("error"):
+            st.caption(f"Couldn't load the catalog list ({str(_cat_state['error'])[:200]}). "
+                       f"Enter a catalog name instead.")
+        catalog = st.text_input("Catalog", value=st.session_state.get("catalog") or "main").strip()
 
     st.markdown("")
     col_back, col_continue = st.columns([1, 3])
@@ -1227,6 +1471,8 @@ elif st.session_state.step == 2:
                 st.error("Select at least one benchmark.")
             elif not warehouse_id:
                 st.error("Select a Lakehouse//RT warehouse.")
+            elif not catalog:
+                st.error("Select or enter a catalog.")
             elif warehouse_id == "__CREATE_NEW__":
                 with st.spinner(f"Creating Lakehouse//RT warehouse **{warehouse_name}**..."):
                     result = create_reyden_warehouse(
@@ -1281,7 +1527,7 @@ elif st.session_state.step == "2b":
         with st.spinner("Connecting to warehouse..."):
             wh_info = _get_warehouse_info(warehouse_id)
             st.session_state.wh_info = wh_info
-            probe = execute_sql(warehouse_id, "SELECT 1", catalog, "default")
+            probe = execute_sql(warehouse_id, "SELECT 1", "system", "information_schema")
             if probe["status"] != "ok":
                 st.error(
                     f"Could not connect to warehouse. "
@@ -1400,6 +1646,42 @@ elif st.session_state.step == "2b":
     any_needs_creation = _flags["needs_creation"]
     any_has_issues = _flags["has_issues"]
 
+    # --- Permission pre-flight for data creation ---
+    perm_blocked = False
+    if any_needs_creation:
+        _needed_schemas = [WORKLOAD_META[k]["schema"] for k in selected_workloads
+                           if validations.get(k, {}).get("needs_creation")]
+        _pc_key = (catalog, tuple(_needed_schemas))
+        if st.session_state.get("_perm_check_key") != _pc_key:
+            with st.spinner(f"Checking your permissions in `{catalog}`..."):
+                st.session_state._perm_check = check_create_permissions(
+                    warehouse_id, catalog, _needed_schemas)
+                st.session_state._perm_check_key = _pc_key
+        _perm = st.session_state._perm_check
+        if _perm.get("error") and not _perm.get("catalog_missing"):
+            st.caption(f"Couldn't pre-check permissions ({str(_perm['error'])[:200]}). "
+                       f"Data creation will be attempted and any errors reported.")
+        elif _perm.get("blocked"):
+            perm_blocked = True
+            st.markdown("---")
+            _render_permission_help(_perm, (st.session_state.get("_catalogs") or {}).get("items"))
+            _pc1, _pc2 = st.columns(2)
+            with _pc1:
+                if st.button("Change catalog", use_container_width=True):
+                    st.session_state.pop("_perm_check_key", None)
+                    st.session_state.validation = None
+                    st.session_state.step = 2
+                    st.rerun()
+            with _pc2:
+                if st.button("Re-check permissions", use_container_width=True):
+                    st.session_state.pop("_perm_check_key", None)
+                    st.session_state.pop("_catalogs", None)
+                    st.session_state.validation = None
+                    st.rerun()
+            if st.checkbox("I have access another way (for example, metastore admin). Try anyway.",
+                           value=False):
+                perm_blocked = False
+
     # --- DBSQL warehouse (only when data creation or fixes are needed) ---
     if any_needs_creation or any_has_issues:
         st.markdown("---")
@@ -1458,10 +1740,14 @@ elif st.session_state.step == "2b":
             st.session_state.step = 2
             st.session_state.validation = None
             st.session_state.pop("_all_warehouses", None)
+            st.session_state.pop("_perm_check_key", None)
             st.rerun()
     with col_c:
         if any_needs_creation:
-            if not dbsql_wh_id:
+            if perm_blocked:
+                st.button("Create Data & Run Benchmark", type="primary", use_container_width=True,
+                          disabled=True, help="Resolve the permission issue above first")
+            elif not dbsql_wh_id:
                 st.error("Select a DBSQL warehouse to create benchmark data.")
             elif st.button("Create Data & Run Benchmark", type="primary", use_container_width=True):
                 st.session_state.write_warehouse_id = dbsql_wh_id
@@ -1502,6 +1788,50 @@ elif st.session_state.step == "2c":
     _step_chip("CREATING DATA")
     st.markdown("### Creating Benchmark Data")
 
+    # --- Previous creation attempt failed: show why and how to resolve ---
+    _failure = st.session_state.get("_create_failure")
+    if _failure:
+        _failed_names = ", ".join(WORKLOAD_META[k]["name"] for k in _failure["failed_workloads"])
+        st.error(f"Benchmark data could not be created for **{_failed_names}**, "
+                 f"so the benchmark was not started.")
+        with st.expander("Error details", expanded=not _failure["is_permission"]):
+            for _e in _failure["errors"][:20]:
+                st.code(str(_e)[:800], language="text")
+        if _failure["is_permission"] and _failure.get("perm"):
+            _render_permission_help(_failure["perm"],
+                                    (st.session_state.get("_catalogs") or {}).get("items"))
+        _ok_wls = [k for k in st.session_state.selected_workloads
+                   if k not in _failure["failed_workloads"]]
+        _fb1, _fb2, _fb3 = st.columns(3)
+        with _fb1:
+            if st.button("Change catalog", use_container_width=True):
+                st.session_state.pop("_create_failure", None)
+                st.session_state.pop("_perm_check_key", None)
+                st.session_state.validation = None
+                st.session_state.step = 2
+                st.rerun()
+        with _fb2:
+            if st.button("Back to validation", use_container_width=True):
+                st.session_state.pop("_create_failure", None)
+                st.session_state.pop("_perm_check_key", None)
+                st.session_state.pop("_catalogs", None)
+                st.session_state.validation = None
+                st.session_state.step = "2b"
+                st.rerun()
+        with _fb3:
+            if _ok_wls and st.button(f"Run the other {len(_ok_wls)} benchmark(s) anyway",
+                                     use_container_width=True):
+                st.session_state.pop("_create_failure", None)
+                st.session_state.selected_workloads = _ok_wls
+                st.session_state.test_id = f"bench_{uuid.uuid4().hex[:8]}"
+                st.session_state.run_start = time.time()
+                st.session_state.results = None
+                st.session_state.step = 3
+                st.rerun()
+        st.stop()
+
+    _create_errors = []  # list of (workload_key, error_message)
+
     # Guard: only run creation once per step-2c entry
     if not st.session_state.get("_creation_done"):
         if st.session_state.get("_creating"):
@@ -1510,7 +1840,6 @@ elif st.session_state.step == "2c":
             st.stop()
 
         st.session_state._creating = True
-        _create_errors = []
 
         try:
             selected_workloads = st.session_state.selected_workloads
@@ -1536,17 +1865,51 @@ elif st.session_state.step == "2c":
                     progress_bar.progress(pct)
                     status_ph.markdown(f"**{msg}**")
 
-                create_benchmark_tables(write_wh, catalog, wl_key, _on_progress)
+                wl_errors = create_benchmark_tables(write_wh, catalog, wl_key, _on_progress) or []
                 progress_bar.progress(100)
-                status_ph.success(f"**{meta['name']}** tables created")
+                if wl_errors:
+                    _create_errors.extend((wl_key, e) for e in wl_errors)
+                    status_ph.error(f"**{meta['name']}**: {len(wl_errors)} step(s) failed")
+                else:
+                    status_ph.success(f"**{meta['name']}** tables created")
 
         except Exception as exc:
-            _create_errors.append(str(exc))
+            _create_errors.append(("", str(exc)))
             st.warning(f"\u26a0\ufe0f Table creation encountered errors: {exc}")
         finally:
             # Always clear the lock and mark done, even on error
             st.session_state._creating = False
             st.session_state._creation_done = True
+
+    # Any failure blocks the run (queries against missing tables would all fail)
+    if _create_errors:
+        st.session_state.pop("_creation_done", None)
+        st.session_state.pop("_creating", None)
+        _needing = [k for k in st.session_state.selected_workloads
+                    if (st.session_state.validation or {}).get(k, {}).get("needs_creation")]
+        _failed_wls = [k for k in st.session_state.selected_workloads
+                       if k in {wk for wk, _ in _create_errors if wk}] or _needing
+        _is_perm = any(_is_permission_error(e) for _, e in _create_errors)
+        _perm = None
+        if _is_perm:
+            _cat = st.session_state.catalog
+            _failed_schemas = [WORKLOAD_META[k]["schema"] for k in _failed_wls]
+            try:
+                _perm = check_create_permissions(st.session_state.warehouse_id, _cat, _failed_schemas)
+            except Exception:
+                _perm = None
+            if not _perm or (_perm.get("error") and not _perm.get("catalog_missing")):
+                _perm = {"catalog": _cat, "me": "", "catalog_owner": "", "schemas": {},
+                         "can_manage_catalog": False}
+            # The real attempt failed, so treat every failed schema as blocked
+            _perm["blocked"] = _failed_schemas
+        st.session_state._create_failure = {
+            "errors": [e for _, e in _create_errors],
+            "failed_workloads": _failed_wls,
+            "is_permission": _is_perm,
+            "perm": _perm,
+        }
+        st.rerun()
 
     # Transition to benchmark execution
     st.session_state.pop("_creation_done", None)
