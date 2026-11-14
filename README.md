@@ -9,7 +9,7 @@ results. No notebooks or code are required to use it.
 | File | Purpose |
 | --- | --- |
 | `app.py` | The application |
-| `benchmark_queries.py` | TPC-H and ClickBench query text |
+| `benchmark_queries.py` | TPC-H query text |
 | `app.yaml` | App start command (no environment-specific values) |
 | `requirements.txt` | Python dependencies, installed automatically at deploy |
 | `help.md` | In-app help, shown in the sidebar |
@@ -133,10 +133,6 @@ With the CLI: `databricks apps stop lakehouse-rt-benchmark` and
 
 ## 6. Notes and limitations
 
-* **ClickBench** expects source data at `samples.clickbench.hits`, which is not in the
-  standard `samples` catalog. Use TPC-H only, unless `<catalog>.benchmark_clickbench.hits`
-  has already been loaded separately (about 100M rows). The app validates and uses an
-  existing table if one is present.
 * Results are displayed in the app only and are not persisted to a table.
 * If the dependency install fails on `databricks-sql-connector[kernel]>=4.9,<5`, change that
   line to `databricks-sql-connector>=4.0.0` and redeploy. The app automatically falls back

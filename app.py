@@ -1,4 +1,4 @@
-"""Lakehouse//RT Benchmark App — run ClickBench & TPC-H directly from the app.
+"""Lakehouse//RT Benchmark App — run TPC-H directly from the app.
 
 Executes queries against SQL warehouses via the Statement Execution API
 using the visiting user's OBO token. No external jobs or notebooks needed.
@@ -495,8 +495,6 @@ def execute_benchmark_query(conn, statement: str) -> dict:
 # Workload helpers
 # ---------------------------------------------------------------------------
 WORKLOAD_META = {
-    "clickbench": {"name": "ClickBench", "schema": "benchmark_clickbench", "queries": 43,
-                   "tables": ["hits"], "source_schema": "clickbench"},
     "tpch_sf1": {"name": "TPC-H SF1", "schema": "benchmark_tpch_sf1", "queries": 22,
                  "tables": ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"],
                  "source_schema": "tpch_sf1"},
@@ -511,14 +509,13 @@ WORKLOAD_META = {
                     "source_schema": "tpch_sf1000"},
 }
 
-# Canonical run order (ClickBench first, then TPC-H smallest to largest)
-WORKLOAD_ORDER = ["clickbench", "tpch_sf1", "tpch_sf10", "tpch_sf100", "tpch_sf1000"]
+# Canonical run order (TPC-H smallest to largest)
+WORKLOAD_ORDER = ["tpch_sf1", "tpch_sf10", "tpch_sf100", "tpch_sf1000"]
 
 # Warehouse size recommendation per workload
 WORKLOAD_WH_SIZE = {
     "tpch_sf1": "Small", "tpch_sf10": "Small",
     "tpch_sf100": "Medium", "tpch_sf1000": "Large",
-    "clickbench": "Medium",
 }
 
 def _classify_warehouse(wh_dict: dict) -> str:
@@ -837,10 +834,9 @@ EXPECTED_ROWS = {
                    "part": 20_000_000, "partsupp": 80_000_000, "orders": 150_000_000, "lineitem": 600_037_902},
     "tpch_sf1000": {"region": 5, "nation": 25, "supplier": 10_000_000, "customer": 150_000_000,
                     "part": 200_000_000, "partsupp": 800_000_000, "orders": 1_500_000_000, "lineitem": 5_999_989_709},
-    "clickbench": {"hits": 99_997_497},
 }
 
-# Clustering spec per workload (only certain SF / workloads have clustering)
+# Clustering spec per workload (only certain scale factors have clustering)
 # {workload_key: {table: [cluster_columns]}}
 CLUSTERING_SPEC = {
     "tpch_sf1000": {
@@ -848,22 +844,18 @@ CLUSTERING_SPEC = {
         "orders": ["o_orderdate"],
         "lineitem": ["l_shipdate"],
     },
-    "clickbench": {
-        "hits": ["CounterID", "EventDate", "UserID"],
-    },
 }
 
 # Tables that need OPTIMIZE FULL after clustering
 OPTIMIZE_TABLES = {
     "tpch_sf1000": ["customer", "orders", "lineitem"],
-    "clickbench": ["hits"],
 }
 
 
 def _target_schema(workload_key: str) -> str:
     """The canonical schema name for a workload."""
     meta = WORKLOAD_META[workload_key]
-    return meta["schema"]  # e.g. "tpch_sf1", "clickbench"
+    return meta["schema"]  # e.g. "benchmark_tpch_sf1"
 
 
 
@@ -1311,21 +1303,12 @@ with st.sidebar:
 if st.session_state.step == 1:
     _render_banner()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### ClickBench")
-        st.markdown(
-            "**43** analytical queries against a web-analytics dataset (~15 GB). "
-            "Covers aggregation, filtering, sorting, and string operations "
-            "on a single wide table."
-        )
-    with col2:
-        st.markdown("### TPC-H")
-        st.markdown(
-            "**22** TPC-H-derived queries at scale factors from 1 GB to 1 TB. "
-            "Covers complex joins, subqueries, and aggregations across an "
-            "8-table star schema."
-        )
+    st.markdown("### TPC-H")
+    st.markdown(
+        "**22** TPC-H-derived queries at scale factors from 1 GB to 1 TB. "
+        "Covers complex joins, subqueries, and aggregations across an "
+        "8-table star schema."
+    )
 
     st.markdown("")
     if st.button("Get Started", type="primary", use_container_width=True):
@@ -1341,41 +1324,21 @@ elif st.session_state.step == 2:
     _step_chip("STEP 1 \u2014 CONFIGURE")
     st.markdown("### Select Benchmarks")
 
-    # --- Workload selection ---
-    cb_col, tpch_col = st.columns(2)
-    with cb_col:
-        run_clickbench = st.checkbox("ClickBench", value=False,
-                                     help="43 queries, ~15 GB web-analytics dataset")
-    with tpch_col:
-        run_tpch = st.checkbox("TPC-H", value=False,
-                               help="22 queries across 8-table star schema")
+    # --- Workload selection (TPC-H scale factors) ---
+    st.markdown("**TPC-H Scale Factors** (22 queries across an 8-table star schema)")
+    sf_cols = st.columns(4)
+    sf_checks = {}
+    for i, (sf_key, sf_label) in enumerate([
+        ("tpch_sf1", "SF1 (~1 GB)"), ("tpch_sf10", "SF10 (~10 GB)"),
+        ("tpch_sf100", "SF100 (~100 GB)"),
+        ("tpch_sf1000", "SF1000 (~1 TB)")
+    ]):
+        with sf_cols[i]:
+            sf_checks[sf_key] = st.checkbox(sf_label, value=False)
+    selected_workloads = [k for k in WORKLOAD_ORDER if sf_checks.get(k)]
 
-    selected_workloads = []
-    if run_clickbench:
-        selected_workloads.append("clickbench")
-
-    if run_tpch:
-        st.markdown("**TPC-H Scale Factors**")
-        sf_cols = st.columns(4)
-        sf_checks = {}
-        for i, (sf_key, sf_label) in enumerate([
-            ("tpch_sf1", "SF1 (~1 GB)"), ("tpch_sf10", "SF10 (~10 GB)"),
-            ("tpch_sf100", "SF100 (~100 GB)"),
-            ("tpch_sf1000", "SF1000 (~1 TB)")
-        ]):
-            with sf_cols[i]:
-                sf_checks[sf_key] = st.checkbox(sf_label, value=False)
-        for sf_key in ["tpch_sf1", "tpch_sf10", "tpch_sf100", "tpch_sf1000"]:
-            if sf_checks.get(sf_key):
-                selected_workloads.append(sf_key)
-
-    if run_tpch and not any(sf_checks.get(k) for k in ["tpch_sf1", "tpch_sf10", "tpch_sf100", "tpch_sf1000"]):
-        st.warning("Select at least one TPC-H scale factor.")
-        if not run_clickbench:
-            st.markdown("---")
-            st.stop()
     if not selected_workloads:
-        st.warning("Select at least one benchmark to continue.")
+        st.warning("Select at least one TPC-H scale factor to continue.")
         st.markdown("---")
         st.stop()
 
@@ -1591,17 +1554,11 @@ elif st.session_state.step == "2b":
             else:
                 st.markdown(f"\u2003\u2705 **{t}**")
 
-    # Separate ClickBench and TPC-H workloads
-    cb_workloads = [w for w in selected_workloads if w == "clickbench"]
     tpch_workloads = [w for w in selected_workloads if w.startswith("tpch_")]
-
-    # Render ClickBench (single table, always vertical)
-    for wl_key in cb_workloads:
-        _render_single_workload(wl_key)
 
     # Render TPC-H
     if len(tpch_workloads) <= 1:
-        # Single TPC-H scale: vertical list (same as ClickBench)
+        # Single TPC-H scale: vertical list
         for wl_key in tpch_workloads:
             _render_single_workload(wl_key)
     else:

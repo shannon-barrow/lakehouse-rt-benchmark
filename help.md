@@ -45,7 +45,7 @@
 - You can click **Run Anyway** to proceed without stats; results may be slightly suboptimal.
 
 ### "Clustering missing" warnings
-- Large tables (e.g. `hits` for ClickBench, `lineitem`/`orders`/`customer` for TPC-H SF1000) need liquid clustering.
+- Large tables (`lineitem`/`orders`/`customer` for TPC-H SF1000) need liquid clustering.
 - The app applies clustering via `ALTER TABLE ... CLUSTER BY (...)` followed by `OPTIMIZE`.
 - Requires write access via the DBSQL warehouse.
 
@@ -106,7 +106,6 @@
 
 | Workload | Queries | Data Size | Recommended WH Size |
 |---|---|---|---|
-| ClickBench | 43 | ~15 GB | Medium |
 | TPC-H SF1 | 22 | ~1 GB | Small |
 | TPC-H SF10 | 22 | ~10 GB | Small |
 | TPC-H SF100 | 22 | ~100 GB | Medium |
@@ -117,7 +116,7 @@
 ## Architecture
 
 - **Authentication**: OBO (On-Behalf-Of) tokens — the app acts as the logged-in user via `X-Forwarded-Access-Token`.
-- **Data location**: `{catalog}.benchmark_clickbench` and `{catalog}.benchmark_tpch_sfN`.
+- **Data location**: `{catalog}.benchmark_tpch_sfN`.
 - **Warehouse sizing**: The app auto-selects the largest required size across all selected workloads.
 - **Lakehouse//RT**: `warehouse_type = REYDEN` — the benchmark target (read-optimized).
 - **DBSQL**: Used only for data creation and fixes (write operations).
@@ -127,7 +126,7 @@
 ## FAQ
 
 **Can I run multiple benchmarks at once?**
-Yes — select ClickBench and/or multiple TPC-H scale factors. They run sequentially with combined results.
+Yes — select multiple TPC-H scale factors. They run sequentially with combined results.
 
 **Why is the warehouse size auto-determined?**
 The app picks the largest required size. Selecting TPC-H SF1 (Small) and SF1000 (Large) results in a Large warehouse.
